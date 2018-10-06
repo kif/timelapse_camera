@@ -169,7 +169,7 @@ class TimeLaps(threading.Thread):
                  folder=".", avg_awb=200, avg_ev=25, config_file="parameters.json"):
         threading.Thread.__init__(self, name="TimeLaps")
         self.storage = {}
-        self.storage_maxlen = 10
+        self.storage_maxlen = 100
         self.pool_of_analyzers = []
         self.pool_size_analyzer = 2
         self.pool_of_savers = []
@@ -288,6 +288,7 @@ class TimeLaps(threading.Thread):
                 if self.position not in self.storage:
                     self.storage[self.position] = deque(maxlen=self.storage_maxlen) 
                 self.storage[self.position].append(frame) 
+                self.camera_queue.task_done()
                 if time.time() >= self.next_img:
                     self.next_img = frame.timestamp + self.delay
                     frame.gravity = self.accelero.get()
@@ -296,7 +297,7 @@ class TimeLaps(threading.Thread):
                     if next_pos != self.position:
                         self.servo_status = self.trajectory.goto_pos(next_pos)
                         self.position = next_pos
-                self.camera_queue.task_done()
+                
                 logger.info("Frame #%04i. Length of queues: camera %i, analysis %i saving %i config %i", 
                                 frame.index,
                                 self.camera_queue.qsize(), 

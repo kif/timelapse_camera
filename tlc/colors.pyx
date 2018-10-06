@@ -140,6 +140,8 @@ def yuv420_to_rgb16(stream, resolution):
      [1.164383 -0.391762 -0.812968
      [1.164383 2.017232 0 
     
+    #TODO: double check there should be a decompression to RGB16 linear space
+    
     :param stream: string (bytes) with the stream
     :param resolution: 2-tuple (width, height)
     :return: YUV array + historgram of Y,R,G,B

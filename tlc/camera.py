@@ -25,7 +25,7 @@ from PIL import Image
 import pyexiv2
 from picamera import PiCamera
 from scipy.signal import convolve, gaussian, savgol_coeffs
-from exposure import lens
+from .exposure import lens
 logger = logging.getLogger("camera")
 import signal
 try:
@@ -33,19 +33,24 @@ try:
 except ImportError:
     blosc=None
     FILE_EXT = ".yuv"
+
 else:
-    BLOSC_OPTIONS = {"typesize":1, 
-                     "shuffle":blosc.BITSHUFFLE, 
-                     cname='lz4hc',
+    BLOSC_OPTIONS = {"typesize": 1, 
+                     "shuffle": blosc.BITSHUFFLE, 
+                     "cname": 'lz4',
                      }
     FILE_EXT = ".blosc_yuv"
+    blosc.set_releasegil(True)
 try:
-    import colors as _colors
+    from . import colors as _colors
 except ImportError:
     logger.warning("Colors module not available, using slow Python implementation")
     colors = None
 else:
-    colors = _colors.Flatfield("flatfield.txt")
+    ff = "flatfield.txt"
+    if not os.path.exists(ff):
+        ff = os.path.join(os.path.dirname(__file__), ff)
+    colors = _colors.Flatfield(ff)
     sRGB = _colors.SRGB()
 ExpoRedBlue = namedtuple("ExpoRedBlue", ("ev", "red", "blue"))
 GainRedBlue = namedtuple("GainRedBlue", ("red", "blue"))
@@ -193,7 +198,7 @@ class Frame(object):
     def load(cls, fname):
         """load the raw data on one side and the header on the other"""
         
-        with open(fname) as f:
+        with open(fname, "rb") as f:
             raw = f.read()
         if (blosc is not None) and (fname.endswith(FILE_EXT)):
             new = cls(data=None, compressed=raw)
@@ -211,7 +216,7 @@ class Frame(object):
     def save(self):
         "Save the data as YUV raw data"
         fname = self.get_date_time() + FILE_EXT
-        with open(fname, "w") as f:
+        with open(fname, "wb") as f:
             f.write(self.data)
         fname = self.get_date_time()+".json"
         comments = OrderedDict((("index", self.index),))
@@ -236,7 +241,7 @@ class StreamingOutput(object):
         :param size: size of an image in bytes. 
         For YUV, it is 1.5x the number of pixel of the padded image.
         """
-        self.size = size
+        self.size = int(size)
         self.frame = None
         self.buffer = io.BytesIO()
         self.condition = threading.Condition()
@@ -281,7 +286,7 @@ class Camera(threading.Thread):
         self.histo_ev = histo_ev or []
         self.wb_red = wb_red or []
         self.wb_blue = wb_blue or []
-        raw_size = (((resolution[0]+31)& ~(31))*((resolution[1]+15)& ~(15))*3//2)
+        self.raw_image_size = (((resolution[0]+31)& ~(31))*((resolution[1]+15)& ~(15))*3//2)
         self.stream = StreamingOutput(raw_size)
         self.camera = PiCamera(resolution=resolution, framerate=framerate, sensor_mode=sensor_mode)
         self.delay = 1.0
@@ -358,51 +363,42 @@ class Camera(threading.Thread):
         framerate = self.camera.framerate
         self.camera.awb_mode = "auto"
         self.camera.exposure_mode = "auto"
-        #self.camera.framerate = 10
         time.sleep(delay)
-        #for i in range(int(delay//self.delay)):
-            #rg, bg = self.camera.awb_gains
-            #rg = float(rg)
-            #bg = float(bg)
-            #if rg == 0.0:
-            #    rg = 1.0
-            #if bg == 0.0:
-            #    bg = 1.0
-            #self.wb_red.append(rg)
-            #self.wb_blue.append(bg)
-            #time.sleep(self.delay)
         self.camera.framerate = framerate
 
     def run(self):
-        "main thread activity"
-        #self.camera.awb_mode = "off" # "auto"
-        #self.camera.exposure_mode = "off" #night" #"auto"
+        "main thread activity: record frames and put them in the queue"
         self._done_recording.clear()
+        
         for foo in self.camera.capture_continuous(self.stream, format='yuv'):
-            self._done_recording.set()
-            if self.stream.frame is not None:
-                frame = self.stream.frame
-                logger.debug("Acquired %s", frame)
-                frame.camera_meta = self.get_metadata()
-                self.queue.put(frame)
-            else:
-                logger.info("No frame acquired")
-            if self.quit_event.is_set():
+            try:
+                self._done_recording.set()
+                if self.stream.frame is not None:
+                    frame = self.stream.frame
+                    logger.debug("Acquired %s", frame)
+                    frame.camera_meta = self.get_metadata()
+                    self.queue.put(frame)
+                else:
+                    logger.info("No frame acquired")
+                if self.quit_event.is_set():
+                    break
+                # update the camera settings if needed:
+                # Disabled for now at trajlaps level
+                if not self.config_queue.empty():
+                    while not self.config_queue.empty():
+                        evrb = self.config_queue.get()
+                        if evrb.red:
+                            self.wb_red.append(evrb.red)
+                            self.wb_blue.append(evrb.blue)
+                        if evrb.ev:
+                            self.histo_ev.append(evrb.ev)
+                    self.config_queue.task_done()
+                    self.update_expo()    
+                self._can_record.wait()
+                self._done_recording.clear()
+            except KeyboardInterrupt:
+                self.quit_event.set() 
                 break
-            # update the camera settings if needed:
-            # Disabled for now at trajlaps level
-            if not self.config_queue.empty():
-                while not self.config_queue.empty():
-                    evrb = self.config_queue.get()
-                    if evrb.red:
-                        self.wb_red.append(evrb.red)
-                        self.wb_blue.append(evrb.blue)
-                    if evrb.ev:
-                        self.histo_ev.append(evrb.ev)
-                self.config_queue.task_done()
-                self.update_expo()    
-            self._can_record.wait()
-            self._done_recording.clear()
         self.camera.close()
 
     def update_expo(self):
