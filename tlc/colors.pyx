@@ -1,9 +1,17 @@
 #cython: language_level=3, boundscheck=False, wraparound=False, initializedcheck=False, cdivision=True
 
+# tag: openmp
+
+# distutils: extra_compile_args=-fopenmp
+# distutils: extra_link_args=-fopenmp
+
 import cython
 import numpy
-cimport numpy 
+cimport numpy
+from cython.parallel import prange
 from libc.math cimport sqrt, ceil, floor
+import logging
+logger = logging.getLogger(__name__)
 
 
 cpdef int pseudo_dist(int x, int y) nogil:
@@ -27,6 +35,9 @@ cpdef int pseudo_dist(int x, int y) nogil:
     return (approx + 512) >> 10
     
 
+cpdef inline int iclip(int a, int min_value, int max_value) nogil:
+    return min(max(a, min_value), max_value)
+    
 def yuv420_to_yuv(stream, resolution):
     """Convert a YUV420 linear stream into an image YUV444
     
@@ -50,7 +61,7 @@ def yuv420_to_yuv(stream, resolution):
     assert cstream.size >= (ylen + 2 * uvlen), "stream is len enough"
     yuv = numpy.empty((height, width, 3), dtype=numpy.uint8)
     with nogil:
-        for i in range(height):
+        for i in prange(height):
             k = fwidth * i
             l = (fwidth // 2) * (i // 2)
             for j in range(width):
@@ -79,7 +90,7 @@ def yuv420_to_rgb8(stream, resolution):
         float uf, yf, vf
         numpy.uint8_t[::1] cstream = numpy.fromstring(stream, numpy.uint8)
         numpy.uint8_t[:, :, ::1] rgb
-        int[:, ::1] histo
+        numpy.int32_t[:, ::1] histo
     
     histo = numpy.zeros((4, 256), dtype=numpy.int32)
     
@@ -91,7 +102,7 @@ def yuv420_to_rgb8(stream, resolution):
     assert cstream.size >= (ylen + 2 * uvlen), "stream is len enough"
     rgb = numpy.empty((height, width, 3), dtype=numpy.uint8)
     with nogil:
-        for i in range(height):
+        for i in prange(height):
             k = fwidth * i
             l = (fwidth // 2) * (i // 2)
             for j in range(width):
@@ -119,9 +130,9 @@ def yuv420_to_rgb8(stream, resolution):
                 b = <numpy.uint8_t> (yf + 2.017232 * uf)
                 
                 # clip to the 0-255 range
-                r = 0 if r < 0 else (255 if r > 255 else r)
-                g = 0 if g < 0 else (255 if g > 255 else g)
-                b = 0 if b < 0 else (255 if b > 255 else b)
+                r = iclip(r, 0, 255)
+                g = iclip(g, 0, 255)
+                b = iclip(b, 0, 255)
                
                 rgb[i, j, 0] = r
                 rgb[i, j, 1] = g
@@ -213,20 +224,14 @@ def yuv420_to_rgb16(stream, resolution):
                 b = (y + bu * u)
                 
                 #Clip to 0-65535
-                r = 0 if r < 0 else (65535 if r > 65535 else r)
-                g = 0 if g < 0 else (65535 if g > 65535 else g)
-                b = 0 if b < 0 else (65535 if b > 65535 else b)
+                r = iclip(r, 0, 65535)
+                g = iclip(g, 0, 65535)
+                b = iclip(b, 0, 65535)
 
                 histo[1, (r + (1 << 7)) >> 8] += 1
                 histo[2, (g + (1 << 7)) >> 8] += 1
                 histo[3, (b + (1 << 7)) >> 8] += 1
                 
-                
-                #Normalization
-                r = 0 if r < 0 else (65535 if r > 65535 else r)
-                g = 0 if g < 0 else (65535 if g > 65535 else g)
-                b = 0 if b < 0 else (65535 if b > 65535 else b)
-
                 rgb[i, j, 0] = r
                 rgb[i, j, 1] = g
                 rgb[i, j, 2] = b
@@ -246,18 +251,27 @@ cdef class SRGB:
         cdef:
             float c, a=0.055, res
             int i, s 
-        self.LUT = numpy.empty(1<<16, dtype=numpy.uint8)
-        with nogil:
-            for i in range(1<<16):
-                c = <float>i / 65535.
-                if c < 0.0031308:
-                    res = <int>(12.92 * c *255 + 0.5)
-                else:
-                    res = (((1+a)*c**(1/2.4) - a) * 255 + 0.5)
-                self.LUT[i] = <int> res
+        self.LUT = self.init_LUT()
 
     def __dealloc__(self):
         self.LUT = None
+    
+    def init_LUT(self, float a=0.055, float slope=12.92, float gamma=2.4, float clim=0.0031308):
+        """Initialize the LUT from linear RGB16 to sRGB (8bits)"""
+        logger.info("Initialize the sRGB gamma 2.4 LUT") 
+        cdef:
+            float c, res, inv_gamma=1.0/gamma
+            int i, s 
+            numpy.uint8_t[::1] LUT = numpy.empty(1<<16, dtype=numpy.uint8)
+        with nogil:
+            for i in range(1<<16):
+                c = i / 65535.0
+                if c < clim:
+                    res = slope * c
+                else:
+                    res = (1+a)*c**(inv_gamma) - a
+                LUT[i] = <numpy.uint8_t> (255.0*res + 0.5) #scaling and rounding        
+        return LUT
     
     def compress(self, numpy.uint16_t[:, :, ::1] inp):
         """Compress a RGB16 linear into a sRGB8 image"""
@@ -269,7 +283,7 @@ cdef class SRGB:
         width = inp.shape[1]
         out = numpy.empty((height, width, 3), dtype=numpy.uint8)
         with nogil:
-            for i in range(height):
+            for i in prange(height):
                 for j in range(width):
                     for k in range(3):
                         out[i, j, k] = self.LUT[inp[i, j, k]]
@@ -287,7 +301,7 @@ cdef class SRGB:
         width = im1.shape[1]
         out = numpy.empty((height, width, 3), dtype=numpy.uint16)
         with nogil:
-            for i in range(height):
+            for i in prange(height):
                 for j in range(width):
                     for k in range(3):
                         r = im1[i, j, k] + im2[i, j, k]
@@ -298,15 +312,17 @@ cdef class SRGB:
                             out[i, j, k] = r
         return numpy.asarray(out), overflow
         
+        
 cdef class Flatfield:
     cdef: 
-        readonly  numpy.uint16_t[::1] lut_r, lut_g, lut_b, LUT 
+        readonly  numpy.uint16_t[::1] lut_r, lut_g, lut_b, dLUT, cLUT 
         int nbits
         
     def __cinit__(self, flatfile=None, nbits=14):
         self.nbits = nbits
-        self.LUT = self.calc_gamma()
+        self.dLUT, self.cLUT = self.calc_gamma()
         if flatfile is None:
+            logger.info("No Flatfield found, doing without")
             self.lut_r = None
             self.lut_g = None
             self.lut_b = None
@@ -314,31 +330,43 @@ cdef class Flatfield:
             self.lut_r, self.lut_g, self.lut_b = self.calc_colors(flatfile, nbits=self.nbits)      
 
     def __dealloc__(self):
-        #self.radius = None
-        #self.red = None
-        #self.green = None
-        #self.blue = None
-        #self.data = None
-        self.LUT = None
+        self.cLUT = None
+        self.dLUT = None
         self.lut_r = None
         self.lut_g = None
         self.lut_b = None
 
     def calc_gamma(self, float a=0.099, float slope=4.5, float gamma=1.0 / 0.45, float clim=0.081):
+        """Calculate the 16bit LUT for compression and decompression 
+        
+        This uses the gamma from the camera which is 2.222
+        
+        :return: Decompression, Compression"""
         #rg/4.5 if rg<=0.081 else ((rg+0.099)/1.099)**(gamma)
         cdef:
-            float c, res 
+            float c, res, inv_gamma= 1.0/gamma, one_plus_a=1.0+a
             int i
-        print("initialize the gamma LUT") 
-        LUT = numpy.empty(1 << 16, dtype=numpy.uint16)
+            numpy.uint16_t[::1] dLUT, cLUT
+        logger.info("Initialize the gamma 2.2 LUT") 
+        dLUT = numpy.zeros(1 << 16, dtype=numpy.uint16)
+        cLUT = numpy.zeros(1 << 16, dtype=numpy.uint16)
         for i in range(1 << 16):
+            #Manage decompression:
             c = i / 65535.0
             if c < clim:
-                res = (i / slope) + 0.5
+                res = (c / slope)
             else:
-                res = 65535.0 * ((c + a) / (1.0 + a)) ** (gamma) + 0.5
-            LUT[i] = <numpy.uint16_t> res
-        return LUT
+                res = ((c + a) / one_plus_a) ** (gamma)
+            dLUT[i] = <numpy.uint16_t>(65535.0 * res + 0.5) # scale and round
+            
+            #Manage compression:
+            if c < (clim/slope):
+                res = c * slope
+            else:
+                
+                res = (one_plus_a * c ** inv_gamma - a)
+            cLUT[i] = <numpy.uint16_t>(65535.0 * res + 0.5) # scale and round
+        return dLUT, cLUT
 
     def calc_colors(self, flatfile, int nbits=14):
         """Initalizes the tree colors LUTs, on 14 bits"""
@@ -348,7 +376,7 @@ cdef class Flatfield:
             numpy.uint16_t[::1] lut_r, lut_g, lut_b, count
             float cr, cb, cg, rd, position, cp, fp, delta_low, delta_hi, rmin, rmax, dr
             float[::1] radius, sred, sblue, sgreen, red, green, blue
-        print("initialize the color LUT")
+        logger.info("Initialize the color LUT")
         data = numpy.loadtxt(flatfile)
         radius = numpy.ascontiguousarray(data[:, 0], dtype=numpy.float32)
         sred = numpy.ascontiguousarray(data[:, 1], dtype=numpy.float32)
@@ -414,9 +442,23 @@ cdef class Flatfield:
             lut_g[d] = <int> cg
             lut_b[d] = <int> cb
         return lut_r, lut_g, lut_b
+
+    def yuv420_to_histo10(self, stream, resolution):
+        """Convert a YUV420 linear stream into an image RGB16 linear
+        array + histogram: 
+        [[1.164383  0  1.596027
+         [1.164383 -0.391762 -0.812968
+         [1.164383 2.017232 0 
+        
+        :param stream: string (bytes) with the stream
+        :param resolution: 2-tuple (width, height)
+        :return: RGB16 array + historgram of Y,R,G,B 10 bits
+        """
+        cdef:
+            numpy.int32_t[:, ::1] histo
                 
     def yuv420_to_rgb16(self, stream, resolution):
-        """Convert a YUV420 linear stream into an image RGB
+        """Convert a YUV420 linear stream into an image RGB16 linear
         array: 
         [[1.164383  0  1.596027
          [1.164383 -0.391762 -0.812968
@@ -424,7 +466,7 @@ cdef class Flatfield:
         
         :param stream: string (bytes) with the stream
         :param resolution: 2-tuple (width, height)
-        :return: YUV array + historgram of Y,R,G,B
+        :return: RGB16 linear array
         """
         cdef:
             int i, j, k, l, m, width, height, fwidth, fheight, ylen, uvlen, d
@@ -434,9 +476,9 @@ cdef class Flatfield:
             int ys, rv, gu, gv, bu
             numpy.uint8_t[::1] cstream = numpy.fromstring(stream, numpy.uint8)
             numpy.uint16_t[:,:,::1] rgb
-            int[:, ::1] histo
+            numpy.int32_t[:, ::1] histo
         
-        histo = numpy.zeros((4, 1024), dtype=numpy.int32)
+        #histo = numpy.zeros((4, 1024), dtype=numpy.int32)
         
         #Coef for Y'UV -> R'G'B'
         #ys = 65535 / (235-16) #1.164
@@ -447,6 +489,7 @@ cdef class Flatfield:
         #gamma = 1/0.45
         # Coef for Y'UV -> R'G'B'
         ys = <int> ((1 << 16) - 1) / (235 - 16) #1.164
+        #+0.5 is for better rounding.
         rv = <int> (((1 << 16) - 1) * 1.596027 / ((1 << 8) - 1) + 0.5)
         gu = <int> (((1 << 16) - 1) * 0.391762 / ((1 << 8) - 1) + 0.5)
         gv = <int> (((1 << 16) - 1) * 0.812968 / ((1 << 8) - 1) + 0.5)
@@ -463,7 +506,7 @@ cdef class Flatfield:
         rgb = numpy.empty((height, width, 3), dtype=numpy.uint16)
         dmax = self.lut_r.size
         with nogil:
-            for i in range(height):
+            for i in prange(height):
                 k = fwidth * i
                 l = (fwidth // 2) * (i // 2)
                 for j in range(width):
@@ -472,127 +515,75 @@ cdef class Flatfield:
                     u = cstream[ylen + l + m]
                     v =cstream[ylen + uvlen + l + m]
                     #histo[0, y] += 1
-                    y -= 16
+                    y = y - 16
 #                    y=0 if y<0 else (219 if y>219 else y)
                     if y < 0: #Saturated black
                         rgb[i, j, 0] = 0
                         rgb[i, j, 1] = 0
                         rgb[i, j, 2] = 0
-                        histo[0, 0] += 1
-                        histo[1, 0] += 1
-                        histo[2, 0] += 1
-                        histo[3, 0] += 1
+                        #histo[0, 0] += 1
+                        #histo[1, 0] += 1
+                        #histo[2, 0] += 1
+                        #histo[3, 0] += 1
                         continue
                     elif y > 219: #Saturated white
                         rgb[i, j, 0] = 65535
                         rgb[i, j, 1] = 65535
                         rgb[i, j, 2] = 65535
-                        histo[0, 1023] += 1
-                        histo[1, 1023] += 1
-                        histo[2, 1023] += 1
-                        histo[3, 1023] += 1
+                        #histo[0, 1023] += 1
+                        #histo[1, 1023] += 1
+                        #histo[2, 1023] += 1
+                        #histo[3, 1023] += 1
                         continue
 
-                    u -= 128
-                    v -= 128
+                    u = u - 128
+                    v = v - 128
                     
-                    # integer version (*65535) 
-                    y *= ys
-                    #add half of the offset to cope for rounding error
+                    # integer version (16 bits) 
+                    y = (y * ys)
+                    
                     r = (y + rv * v)   
                     g = (y - gv * v - gv * u)
                     b = (y + bu * u)
 
-                    # integer version (*65535) 
-                    #y *= 262144
-                    #add half of the offset to cope for rounding error
-                    #r = (y + 104597 * v + (1<<7) ) >> 8 
-                    #g = (y - 53278 * v - 25675 * u + (1<<7)) >> 8
-                    #b = (y + 132201 * u + (1<<7)) >> 8
                     
-                    #Clip to 0-65535
-                    r = 0 if r<0 else (65535 if r>65535 else r)
-                    g = 0 if g<0 else (65535 if g>65535 else g)
-                    b = 0 if b<0 else (65535 if b>65535 else b)
+                    #Clip to 16 bits before storage
+                    r = iclip(r, 0, 65535)
+                    g = iclip(g, 0, 65535)
+                    b = iclip(b, 0, 65535)
 
-                    # switch to 10 bits colors histograms
-                    #histo[1, (r + (1<<7)) >> 8] += 1
-                    #histo[2, (g + (1<<7)) >> 8] += 1
-                    #histo[3, (b + (1<<7)) >> 8] += 1
-                    
-                    #Conversion to linear scale: faster done with LUT
-                    #rf = rg/4.5 if rg<=0.081 else ((rg+0.099)/1.099)**(gamma)
-                    #gf = gg/4.5 if gg<=0.081 else ((gg+0.099)/1.099)**(gamma)
-                    #bf = bg/4.5 if bg<=0.081 else ((bg+0.099)/1.099)**(gamma)
 
                     #Flatfield correction using LUT table
 #                     #Conversion to linear scale using a log scale
                     if self.lut_r is None:
-                        r = self.LUT[r]
-                        g = self.LUT[g]
-                        b = self.LUT[b]
+                        r = self.dLUT[r]
+                        g = self.dLUT[g]
+                        b = self.dLUT[b]
                     else:
                         d = min(dmax-1, pseudo_dist((i - half_height), (j - half_width)))
-                        r = (self.LUT[r] * self.lut_r[d] + (1 << (self.nbits - 1))) >> self.nbits
-                        g = (self.LUT[g] * self.lut_g[d] + (1 << (self.nbits - 1))) >> self.nbits
-                        b = (self.LUT[b] * self.lut_b[d] + (1 << (self.nbits - 1))) >> self.nbits
+                        r = (self.dLUT[r] * self.lut_r[d] + (1 << (self.nbits - 1))) >> self.nbits
+                        g = (self.dLUT[g] * self.lut_g[d] + (1 << (self.nbits - 1))) >> self.nbits
+                        b = (self.dLUT[b] * self.lut_b[d] + (1 << (self.nbits - 1))) >> self.nbits
                     
-#                     #Conversion to linear scale using a log scale
-#                     r = self.LUT[r]
-#                     g = self.LUT[g]
-#                     b = self.LUT[b]
-#                     
-#                     #Flatfield correction
-#                     rd = sqrt(<float>((i-half_height)**2 + (j-half_width)**2))
-#                     if rd <= self.rmin:
-#                         cr = self.red[0]
-#                         cg = self.green[0] 
-#                         cb = self.blue[0] 
-#                     elif rd >= self.rmax:
-#                         cr = self.red[self.size - 1]
-#                         cg = self.green[self.size - 1] 
-#                         cb = self.blue[self.size - 1] 
-#                     else:
-#                         position = (rd - self.rmin) / self.dr
-#                         cp = ceil(position)
-#                         fp = floor(position)
-#                         if cp == fp:
-#                             cr = self.red[<int>cp]
-#                             cg = self.green[<int>cp] 
-#                             cb = self.blue[<int>cp] 
-#                         else: #Bilinear interpolation
-#                             delta_low = position - fp
-#                             delta_hi = cp - position
-#                             cr = self.red[<int>fp]*delta_hi + self.red[<int>cp]*delta_low
-#                             cg = self.green[<int>fp]*delta_hi + self.green[<int>cp]*delta_low
-#                             cb = self.blue[<int>fp]*delta_hi + self.blue[<int>cp]*delta_low
-#                     r = <int>(r * cr + 0.5)
-#                     g = <int>(g * cg + 0.5)
-#                     b = <int>(b * cb + 0.5)
-                    
-                    
-                    #Conversion to gamma scale
-                    #rg = rf*4.5 if rf<=0.018 else (rf**0.45)*1.099 - 0.099
-                    #gg = gf*4.5 if gf<=0.018 else (gf**0.45)*1.099 - 0.099
-                    #bg = bf*4.5 if bf<=0.018 else (bf**0.45)*1.099 - 0.099
                     
                     #cliping
-                    r = 0 if r<0 else (65535 if r>65535 else r)
-                    g = 0 if g<0 else (65535 if g>65535 else g)
-                    b = 0 if b<0 else (65535 if b>65535 else b)
+                    #Clip to 0-65535
+                    r = iclip(r, 0, 65535)
+                    g = iclip(g, 0, 65535)
+                    b = iclip(b, 0, 65535)
 
                     rgb[i, j, 0] = r
                     rgb[i, j, 1] = g
                     rgb[i, j, 2] = b
                     
                     #10 bits RGB histogram
-                    histo[0, self.LUT[y] >> 6] += 1
-                    histo[1, r >> 6] += 1
-                    histo[2, g >> 6] += 1
-                    histo[3, b >> 6] += 1
+                    #histo[0, self.dLUT[y] >> 6] += 1
+                    #histo[1, r >> 6] += 1
+                    #histo[2, g >> 6] += 1
+                    #histo[3, b >> 6] += 1
 
                     
-        return numpy.asarray(rgb), numpy.asarray(histo)
+        return numpy.asarray(rgb)#, numpy.asarray(histo)
 
     def yuv420_to_yuv(self, stream, resolution):
         return yuv420_to_yuv(stream, resolution)

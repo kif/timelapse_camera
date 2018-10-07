@@ -26,7 +26,7 @@ import pyexiv2
 from picamera import PiCamera
 from scipy.signal import convolve, gaussian, savgol_coeffs
 from .exposure import lens
-logger = logging.getLogger("camera")
+logger = logging.getLogger(__name__)
 import signal
 try:
     import blosc
@@ -80,6 +80,30 @@ class SavGol(object):
 savgol0 = SavGol(0)
 savgol1 = SavGol(1)
 
+def calc_gamma(a=0.099, slope=4.5, gamma=1.0 / 0.45, clim=0.081):
+    "Pure python Gamma=2.2 de/compression LUT"
+    #rg/4.5 if rg<=0.081 else ((rg+0.099)/1.099)**(gamma)
+    print("Initialize the gamma LUT") 
+    CMP = numpy.zeros(1 << 16, dtype=numpy.uint16)
+    DCP = numpy.zeros(1 << 16, dtype=numpy.uint16)
+    for i in range(1 << 16):
+        #Manage compression:
+        c = i / 65535.0
+        if c < clim:
+            cmp = (i / slope)
+        else:
+            cmp = 65535.0 * ((c + a) / (1.0 + a)) ** (gamma)
+        CMP[i] = cmp + 0.5 # +0.5 is to round without with the cast
+        
+        #Manage decompression:
+        if c < (clim/slope):
+            dec = i * slope
+        else:
+            
+            dec = 65535.0 * ((1.0+a) * c **(1/gamma) - a)
+        DCP[i] = dec + 0.5
+    return CMP, DCP
+
 
 class Frame(object):
     """This class holds one image"""
@@ -113,6 +137,8 @@ class Frame(object):
         self._yuv = None
         self._rgb = None
         self._histograms = None
+        self.cLUT = None
+        self.dLUT = None
 
     def __repr__(self):
         return "Frame #%04i"%self.index
@@ -169,13 +195,17 @@ class Frame(object):
                     if colors:
                         resolution = self.camera_meta.get("resolution", (640, 480))
                         data = self.data if blosc is None else blosc.decompress(self.data)
-                        self._rgb, self._histograms = colors.yuv420_to_rgb16(data, resolution)
+                        self._rgb = colors.yuv420_to_rgb16(data, resolution)
                     else:
                         YUV[:, :, 0] = YUV[:, :, 0] - 16  # Offset Y by 16
                         YUV[:, :, 1:] = YUV[:, :, 1:] - 128 # Offset UV by 128
                         # Calculate the dot product with the matrix to produce RGB output,
                         # clamp the results to byte range and convert to bytes
-                        self._rgb = (YUV.dot(self.YUV2RGB)*257.0).clip(0, 65535).astype(numpy.uint16)
+                        rgb = (YUV.dot(self.YUV2RGB)*257.0).clip(0, 65535).astype(numpy.uint16)
+                        if self.dLUT is None:
+                            self.cLUT, self.dLUT = calc_gamma()
+                        self._rgb = self.dLUT.take(rgb)
+                        
         return self._rgb
     
     @property
@@ -242,6 +272,7 @@ class StreamingOutput(object):
         For YUV, it is 1.5x the number of pixel of the padded image.
         """
         self.size = int(size)
+        logger.info("Initialize image stream with frame-size %s", self.size)
         self.frame = None
         self.buffer = io.BytesIO()
         self.condition = threading.Condition()
@@ -258,7 +289,7 @@ class StreamingOutput(object):
                 self.condition.notify_all()
             self.buffer.seek(0)
         else:
-            print("Incomplete buffer of %i bytes"%self.buffer.tell())
+            logger.warning("Incomplete buffer of %i bytes"%self.buffer.tell())
         return res
 
 
@@ -287,7 +318,7 @@ class Camera(threading.Thread):
         self.wb_red = wb_red or []
         self.wb_blue = wb_blue or []
         self.raw_image_size = (((resolution[0]+31)& ~(31))*((resolution[1]+15)& ~(15))*3//2)
-        self.stream = StreamingOutput(raw_size)
+        self.stream = StreamingOutput(self.raw_image_size)
         self.camera = PiCamera(resolution=resolution, framerate=framerate, sensor_mode=sensor_mode)
         self.delay = 1.0
 
@@ -363,7 +394,10 @@ class Camera(threading.Thread):
         framerate = self.camera.framerate
         self.camera.awb_mode = "auto"
         self.camera.exposure_mode = "auto"
-        time.sleep(delay)
+        try:
+            time.sleep(delay)
+        except KeyboardInterrupt:
+            self.quit_event.set() 
         self.camera.framerate = framerate
 
     def run(self):
@@ -495,7 +529,8 @@ class Saver(threading.Thread):
                 comments.update(frame.camera_meta)
                 if frame.servo_status:
                     comments.update(frame.servo_status)
-                exif.comment = json.dumps(comments)
+                print(comments)
+                exif.comment = json.dumps(comments).encode("utf-8")
                 exif.write(preserve_timestamps=True)
             self.queue.task_done()
             logger.info("Saving of frame #%i took %.3fs, sum of %s", frame.index, time.time() - t0, comments["summed"])

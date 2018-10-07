@@ -1,25 +1,26 @@
-#!/usr/bin/python3
-
-"""
-Module containing dummy classes not actually controling hardware
-"""
-
+#!/usr/bin/env python3
 from __future__ import division
-from collections import OrderedDict, namedtuple
-import logging
-logger = logging.getLogger("camera")
+from .PCA9685 import PCA9685
+from collections import OrderedDict
+import loggging
+logger = logging.getLogger(__name__)
 
-Gravity = namedtuple("Gravity",["x", "y", "z"])
-
-
+pwm = PCA9685()
 # Set frequency to 50hz, good for servos.
 # gives a period of 20ms/cycle
 FREQ = 330
 RESOLUTION = 4096
+pwm.set_pwm_freq(FREQ)
 
 class Servo(object):
-    """Represent a dummy servomotor"""
-    PROTECT=False
+    """Represent a servomotor"""
+    PROTECT = False 
+    #set to True if the range should be restricted to protect the servo
+
+    # Specification of the servo deg -> us
+    SPEC={  4: 581,#us
+            17: 2380}
+
     def __init__(self, pin, offset=0, reverse=False):
         """
         :param pin: pin number on the PCA9685 card
@@ -38,10 +39,12 @@ class Servo(object):
         tickmin = self.SPEC[amin] / tick
         self.slope = (tickmax - tickmin) / (amax - amin)
         self.inter = tickmin - amin * self.slope 
+        
 
     def move(self, angle):
         "Set the servo motor to the given angle in degree"
         ticks = int(round(self.calc(angle)))
+        pwm.set_pwm(self.pin, 0, ticks)
         self.angle_req = angle
         angle_set = (ticks - self.inter) / self.slope + self.offset
         self.angle_set = -angle_set if self.reverse else angle_set
@@ -54,6 +57,7 @@ class Servo(object):
         
     def off(self):
         "switch off the servo"
+        pwm.set_pwm(self.pin, 0, 0)
         self.angle_req = None
         self.angle_set = None
 
@@ -69,50 +73,6 @@ class Servo(object):
             angle = max(angle, min(angles))
             angle = min(angle, max(angles))
         return (self.inter + self.slope*angle)
-
-
-
-class Accelerometer:
-    """Dummy accelerometer class"""
-    def __init__(self, sensor_range=None, data_rate=None, quit_event=None):
-        self._can_record = None
-        self._done_recording = None
-        self._quit = None
-
-        self.mma8451 = None
-        self.history = []
-        self.stored = Gravity(1,1,1)
-        self.resume()
-    def start(self):
-        pass
-
-    def run(self):
-        "Main thread's activity: collect gravity information"
-        pass 
-        
-    def quit(self, *arg, **kwarg):
-        "quit the main loop and end the thread"
-        pass
-
-    def pause(self):
-        "pause the recording, wait for the current value to be saved"
-        return self.average(reset=True)
-    
-    def resume(self):
-        "resume the recording"
-        pass
-
-    def get(self):
-        """return the gravity vector"""
-        return self.stored
-
-    def average(self, reset=False):
-        "average all values, stores them and return the average" 
-        return self.stored
-
-    def collect(self):
-        "collect a value and adds it to the history"
-        pass
 
 
 SG90 = Servo
@@ -142,4 +102,3 @@ pan = M15S(14, reverse=True, offset=-90)
 #tilt = SG90(15, reverse=False, offset=-90)
 tilt = MG92b(15, reverse=False, offset=-80+26)
 #tss = TSS11MGB(12)
-

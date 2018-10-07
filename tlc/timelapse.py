@@ -2,8 +2,7 @@
 from __future__ import division, print_function
 
 import logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("trajlaps")
+logger = logging.getLogger(__name__)
 
 
 import signal
@@ -17,7 +16,7 @@ try:
 except:
     from queue import Queue
 import datetime
-import os
+import os, sys
 import sys
 import math
 from fractions import Fraction
@@ -25,21 +24,21 @@ import json
 from collections import namedtuple, OrderedDict, deque
 from argparse import ArgumentParser
 try:
-    import servo
+    from . import servo
 except ImportError:
     logger.warning("Unable to import servo module: using dummy servomotors")
-    import dummy
+    from . import dummy
     class servo:
         tilt = dummy.tilt
         pan = dummy.pan
 try:
-    from accelero import Accelerometer
+    from .accelero import Accelerometer
 except ImportError:
     logger.warning("Unable to import accelero module: using dummy Accelerometer")
-    from dummy import Accelerometer
+    from .dummy import Accelerometer
     
-from exposure import lens
-from camera import Camera, Saver, Analyzer, Frame
+from .exposure import lens
+from .camera import Camera, Saver, Analyzer, Frame
 
 tl = None
 
@@ -164,8 +163,8 @@ class Trajectory(object):
         return Position(pan,tilt)
 
 
-class TimeLaps(threading.Thread):
-    def __init__(self, resolution=(3280, 2464), framerate=1, delay=20, 
+class TimeLapse(threading.Thread):
+    def __init__(self, resolution=(2592, 1944), framerate=1, delay=20, 
                  folder=".", avg_awb=200, avg_ev=25, config_file="parameters.json"):
         threading.Thread.__init__(self, name="TimeLaps")
         self.storage = {}
@@ -198,7 +197,7 @@ class TimeLaps(threading.Thread):
             cam_setup = dico.get("camera",{})
             resolution = cam_setup.get("resolution")
             framerate = cam_setup.get("framerate", framerate)
-
+        print(resolution)
         self.camera = Camera(resolution=resolution,                              
                              framerate=framerate,
                              avg_ev=avg_ev, 
@@ -238,7 +237,14 @@ class TimeLaps(threading.Thread):
 
     def quit(self, *arg, **kwarg):
         """called with SIGINT: clean up and quit gracefully"""
+        logger.warning("Ctrl-C caught: stopping")
         self.quit_event.set()
+        logger.warning("Stopping camera")
+        self.camera.join()
+        logger.warning("Stopping saver processes")
+        for saver in self.pool_of_savers:
+            saver.join()
+        #sys.exit(0)
 
     def load_config(self, config_file=None):
         if config_file is None:
@@ -247,9 +253,8 @@ class TimeLaps(threading.Thread):
         if os.path.isfile(config_file):
             with open(self.config_file) as jsonfile:
                 dico = json.load(jsonfile)
-            #print(dico)
             if "trajectory" in dico:
-				self.trajectory.set_config(dico["trajectory"]) 
+                self.trajectory.set_config(dico["trajectory"]) 
             if "camera" in dico:
                 self.camera.set_config(dico["camera"])
             self.delay = dico.get("delay", self.delay)
@@ -310,22 +315,3 @@ class TimeLaps(threading.Thread):
             except KeyboardInterrupt:
                 self.quit_event.set()
                 break
-
-if __name__ == "__main__":
-    try: 
-        from rfoo.utils import rconsole
-    except:
-        pass
-    else:
-        rconsole.spawn_server()
-
-    parser = ArgumentParser("trajlaps", 
-                            description="TimeLaps over a trajectory")
-    parser.add_argument("-j", "--json", help="config file")
-    parser.add_argument("-d", "--debug", help="debug", default=False, action="store_true")
-    
-    args = parser.parse_args()
-    if args.debug:
-        logging.root.setLevel(logging.DEBUG)
-    tl = TimeLaps(config_file=args.json)
-    tl.run()

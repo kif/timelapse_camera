@@ -1,8 +1,10 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 
 import logging
+logger = logging.getLogger(__name__)
+
 import time
-from mma8451 import MMA8451, RANGE_2G, BW_RATE_6_25HZ, BW_RATE_1_56HZ
+from .mma8451 import MMA8451, RANGE_2G, BW_RATE_6_25HZ, BW_RATE_1_56HZ
 from threading import Thread, Event, Semaphore
 from collections import namedtuple
 import signal
